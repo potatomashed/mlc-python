@@ -51,7 +51,8 @@ template <> struct TypeTraits<DLDataType> {
     }
     std::ostringstream os;
     os << DLDataTypeCode2Str(code);
-    if (code != kDLDataTypeFloat8E5M2 && code != kDLDataTypeFloat8E4M3FN) {
+    if (code < kDLDataTypeFloat8Begin) {
+      // for `code >= kDLDataTypeFloat8Begin`, the `bits` is already encoded in `code`
       os << bits;
     }
     if (lanes != 1) {
@@ -63,22 +64,36 @@ template <> struct TypeTraits<DLDataType> {
   static inline MLC_SYMBOL_HIDE std::unordered_map<std::string, DLDataType> preset = {
       {"void", {kDLOpaqueHandle, 0, 0}},
       {"bool", {kDLUInt, 1, 1}},
+      {"int2", {kDLInt, 2, 1}},
       {"int4", {kDLInt, 4, 1}},
       {"int8", {kDLInt, 8, 1}},
       {"int16", {kDLInt, 16, 1}},
       {"int32", {kDLInt, 32, 1}},
       {"int64", {kDLInt, 64, 1}},
+      {"uint2", {kDLUInt, 2, 1}},
       {"uint4", {kDLUInt, 4, 1}},
       {"uint8", {kDLUInt, 8, 1}},
       {"uint16", {kDLUInt, 16, 1}},
       {"uint32", {kDLUInt, 32, 1}},
       {"uint64", {kDLUInt, 64, 1}},
-      {"float8_e4m3fn", {kDLDataTypeFloat8E4M3FN, 8, 1}},
-      {"float8_e5m2", {kDLDataTypeFloat8E5M2, 8, 1}},
       {"float16", {kDLFloat, 16, 1}},
       {"float32", {kDLFloat, 32, 1}},
       {"float64", {kDLFloat, 64, 1}},
+      // bfloat16
       {"bfloat16", {kDLBfloat, 16, 1}},
+      // 8-bit floating point representations
+      {"float8_e3m4", {kDLDataTypeFloat8E3M4, 8, 1}},
+      {"float8_e4m3", {kDLDataTypeFloat8E4M3, 8, 1}},
+      {"float8_e4m3b11fnuz", {kDLDataTypeFloat8E4M3B11FNUZ, 8, 1}},
+      {"float8_e4m3fn", {kDLDataTypeFloat8E4M3FN, 8, 1}},
+      {"float8_e4m3fnuz", {kDLDataTypeFloat8E4M3FNUZ, 8, 1}},
+      {"float8_e5m2", {kDLDataTypeFloat8E5M2, 8, 1}},
+      {"float8_e5m2fnuz", {kDLDataTypeFloat8E5M2FNUZ, 8, 1}},
+      {"float8_e8m0fnu", {kDLDataTypeFloat8E8M0FNU, 8, 1}},
+      // Microscaling (MX) sub-byte floating point representations
+      {"float4_e2m1fn", {kDLDataTypeFloat4E2M1FN, 4, 1}}, // higher 4 bits are unused
+      {"float6_e2m3fn", {kDLDataTypeFloat6E2M3FN, 6, 1}}, // higher 2 bits are unused
+      {"float6_e3m2fn", {kDLDataTypeFloat6E3M2FN, 6, 1}}, // higher 2 bits are unused
   };
 };
 
@@ -98,10 +113,30 @@ MLC_INLINE const char *DLDataTypeCode2Str(int32_t type_code) {
     return "complex";
   case kDLBool:
     return "bool";
+  // 8-bit floating point representations
+  case kDLDataTypeFloat8E3M4:
+    return "float8_e3m4";
+  case kDLDataTypeFloat8E4M3:
+    return "float8_e4m3";
+  case kDLDataTypeFloat8E4M3B11FNUZ:
+    return "float8_e4m3b11fnuz";
   case kDLDataTypeFloat8E4M3FN:
     return "float8_e4m3fn";
+  case kDLDataTypeFloat8E4M3FNUZ:
+    return "float8_e4m3fnuz";
   case kDLDataTypeFloat8E5M2:
     return "float8_e5m2";
+  case kDLDataTypeFloat8E5M2FNUZ:
+    return "float8_e5m2fnuz";
+  case kDLDataTypeFloat8E8M0FNU:
+    return "float8_e8m0fnu";
+  // Microscaling (MX) sub-byte floating point representations
+  case kDLDataTypeFloat4E2M1FN:
+    return "float4_e2m1fn";
+  case kDLDataTypeFloat6E2M3FN:
+    return "float6_e2m3fn";
+  case kDLDataTypeFloat6E3M2FN:
+    return "float6_e3m2fn";
   }
   return "unknown";
 }
@@ -125,11 +160,10 @@ inline DLDataType String2DLDataType(const std::string &source) {
     } else {
       dtype_str = source;
     }
-    if (dtype_str == "float8_e4m3fn") {
-      return {static_cast<uint8_t>(kDLDataTypeFloat8E4M3FN), 8, static_cast<uint16_t>(dtype_lanes)};
-    }
-    if (dtype_str == "float8_e5m2") {
-      return {static_cast<uint8_t>(kDLDataTypeFloat8E5M2), 8, static_cast<uint16_t>(dtype_lanes)};
+    if (auto it = Traits::preset.find(dtype_str); it != Traits::preset.end()) {
+      DLDataType dtype = it->second;
+      dtype.lanes = static_cast<uint16_t>(dtype_lanes);
+      return dtype;
     }
 #define MLC_DTYPE_PARSE_(str, prefix, prefix_len, dtype_code)                                                          \
   if (str.length() >= prefix_len && str.compare(0, prefix_len, prefix) == 0) {                                         \

@@ -7,7 +7,7 @@
 namespace mlc {
 namespace base {
 
-const char *DLDeviceType2Str(DLDeviceType type);
+const char *DLDeviceType2Str(int32_t type);
 DLDevice String2DLDevice(const std::string &source);
 inline bool DeviceEqual(DLDevice a, DLDevice b) { return a.device_type == b.device_type && a.device_id == b.device_id; }
 
@@ -42,7 +42,8 @@ template <> struct TypeTraits<DLDevice> {
     return os.str();
   }
 
-  static inline MLC_SYMBOL_HIDE std::unordered_map<std::string, DLDeviceType> str2device_type = {
+  static inline MLC_SYMBOL_HIDE std::unordered_map<std::string, int32_t> str2device_type = {
+      {"meta", 0},
       {"cpu", kDLCPU},
       {"cuda", kDLCUDA},
       {"cuda_host", kDLCUDAHost},
@@ -67,8 +68,10 @@ template <> struct TypeTraits<DLDevice> {
   };
 };
 
-MLC_INLINE const char *DLDeviceType2Str(DLDeviceType type) {
+MLC_INLINE const char *DLDeviceType2Str(int32_t type) {
   switch (type) {
+  case 0:
+    return "meta";
   case kDLCPU:
     return "cpu";
   case kDLCUDA:
@@ -106,7 +109,7 @@ MLC_INLINE const char *DLDeviceType2Str(DLDeviceType type) {
 inline DLDevice String2DLDevice(const std::string &source) {
   constexpr int64_t i32_max = 2147483647;
   using Traits = TypeTraits<DLDevice>;
-  DLDeviceType device_type;
+  int32_t device_type;
   int64_t device_id = 0;
   try {
     if (size_t c_pos = source.rfind(':'); c_pos != std::string::npos) {
@@ -118,7 +121,7 @@ inline DLDevice String2DLDevice(const std::string &source) {
     if (device_id < 0 || device_id > i32_max) {
       throw std::runtime_error("Invalid device id");
     }
-    return DLDevice{device_type, static_cast<int32_t>(device_id)};
+    return DLDevice{static_cast<DLDeviceType>(device_type), static_cast<int32_t>(device_id)};
   } catch (...) {
   }
   MLC_THROW(ValueError) << "Cannot convert to `Device` from string: " << source;

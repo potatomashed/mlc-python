@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from mlc._cython import DeviceType, PyAny, c_class_core, device_as_pair, device_normalize
+
+if TYPE_CHECKING:
+    import torch
 
 
 @c_class_core("Device")
 class Device(PyAny):
-    def __init__(self, device: str | Device) -> None:
+    def __init__(self, device: str | Device | torch.device) -> None:
         self._mlc_init(device_normalize(device))
 
     @property
@@ -28,3 +33,8 @@ class Device(PyAny):
 
     def __hash__(self) -> int:
         return hash((Device, *self._device_pair))
+
+    def torch(self) -> torch.device:
+        import torch
+
+        return torch.device(str(self))
