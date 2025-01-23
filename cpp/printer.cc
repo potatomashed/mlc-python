@@ -877,10 +877,21 @@ inline void PythonDocPrinter::PrintTypedDoc(const StmtBlock &doc) {
 }
 
 inline void PythonDocPrinter::PrintTypedDoc(const Assign &doc) {
+  if (!doc->lhs.defined()) {
+    if (!doc->rhs.defined()) {
+      MLC_THROW(ValueError) << "`Assign` should have either `lhs` or `rhs` defined, but got neither.";
+    }
+    if (doc->annotation.defined()) {
+      MLC_THROW(ValueError) << "`Assign` should not have `annotation` defined when `lhs` is not defined.";
+    }
+    PrintDoc(doc->rhs.value());
+    MaybePrintCommentInline(doc);
+    return;
+  }
   if (const auto *tuple_doc = doc->lhs->TryCast<TupleObj>()) {
     PrintJoinedDocs(tuple_doc->values, ", ");
   } else {
-    PrintDoc(doc->lhs);
+    PrintDoc(Expr(doc->lhs.Cast<ExprObj>()));
   }
 
   if (doc->annotation.defined()) {

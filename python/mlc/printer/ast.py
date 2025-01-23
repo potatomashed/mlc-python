@@ -262,13 +262,13 @@ class Slice(Expr):
 
 @mlcd.c_class("mlc.printer.ast.Assign", init=False)
 class Assign(Stmt):
-    lhs: Expr
+    lhs: Optional[Expr]
     rhs: Optional[Expr]
     annotation: Optional[Expr]
 
     def __init__(  # noqa: PLR0913, RUF100
         self,
-        lhs: Expr,
+        lhs: Optional[Expr] = None,
         rhs: Optional[Expr] = None,
         annotation: Optional[Expr] = None,
         comment: Optional[str] = None,

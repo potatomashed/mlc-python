@@ -471,11 +471,11 @@ namespace printer {
 struct AssignObj : public ::mlc::Object {
   ::mlc::List<::mlc::core::ObjectPath> source_paths;
   ::mlc::Optional<::mlc::Str> comment;
-  ::mlc::printer::Expr lhs;
+  ::mlc::Optional<::mlc::printer::Expr> lhs;
   ::mlc::Optional<::mlc::printer::Expr> rhs;
   ::mlc::Optional<::mlc::printer::Expr> annotation;
   explicit AssignObj(::mlc::List<::mlc::core::ObjectPath> source_paths, ::mlc::Optional<::mlc::Str> comment,
-                     ::mlc::printer::Expr lhs, ::mlc::Optional<::mlc::printer::Expr> rhs,
+                     ::mlc::Optional<::mlc::printer::Expr> lhs, ::mlc::Optional<::mlc::printer::Expr> rhs,
                      ::mlc::Optional<::mlc::printer::Expr> annotation)
       : source_paths(source_paths), comment(comment), lhs(lhs), rhs(rhs), annotation(annotation) {}
   MLC_DEF_DYN_TYPE(MLC_EXPORTS, AssignObj, ::mlc::printer::StmtObj, "mlc.printer.ast.Assign");
@@ -489,7 +489,7 @@ struct Assign : public ::mlc::printer::Stmt {
       .Field("rhs", &AssignObj::rhs)
       .Field("annotation", &AssignObj::annotation)
       .StaticFn("__init__", ::mlc::InitOf<AssignObj, ::mlc::List<::mlc::core::ObjectPath>, ::mlc::Optional<::mlc::Str>,
-                                          ::mlc::printer::Expr, ::mlc::Optional<::mlc::printer::Expr>,
+                                          ::mlc::Optional<::mlc::printer::Expr>, ::mlc::Optional<::mlc::printer::Expr>,
                                           ::mlc::Optional<::mlc::printer::Expr>>);
 }; // struct Assign
 
