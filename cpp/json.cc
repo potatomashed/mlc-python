@@ -1,6 +1,7 @@
 #include <cstdint>
 #include <iomanip>
 #include <mlc/core/all.h>
+#include <numeric>
 #include <sstream>
 
 namespace mlc {
@@ -491,6 +492,405 @@ inline Any JSONLoads(const char *json_str, int64_t json_str_len) {
   }
   return JSONParser{0, json_str_len, json_str}.Parse();
 }
+
+// --------------------------------------------------------------------------
+// 1) Global constants for Base64 encoding/decoding, endianness and byte-swap
+// --------------------------------------------------------------------------
+static const uint64_t kMLCTensorMagic = 0xDD5E40F096B4A13F;
+static const char kBase64EncTable[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+static const std::array<uint8_t, 256> kBase64DecTable = []() {
+  std::array<uint8_t, 256> ret;
+  // Initialize all entries to 0xFF (invalid)
+  for (int i = 0; i < 256; ++i) {
+    ret[i] = 0xFF;
+  }
+  // Fill valid mappings: 'A'-'Z', 'a'-'z', '0'-'9', '+' and '/'
+  for (int i = 0; i < 64; ++i) {
+    uint8_t c = static_cast<uint8_t>(kBase64EncTable[i]);
+    ret[c] = static_cast<uint8_t>(i);
+  }
+  return ret;
+}();
+static const bool kIsLittleEndian = []() {
+  const uint16_t val = 0x0001;
+  const uint8_t *bytes = reinterpret_cast<const uint8_t *>(&val);
+  return *bytes == 0x01;
+}();
+
+void ByteSwapInPlace(uint8_t *data, size_t elem_size, size_t count) {
+  // Byte-swap in place for elements each having size elem_size.
+  // e.g., to swap 64-bit, pass elem_size=8, to swap 32-bit, pass elem_size=4, etc.
+  for (size_t i = 0; i < count; ++i) {
+    uint8_t *start = data + i * elem_size;
+    // Reverse the elem_size bytes
+    for (size_t j = 0; j < elem_size / 2; ++j) {
+      std::swap(start[j], start[elem_size - 1 - j]);
+    }
+  }
+}
+
+inline void DefaultDLTensorDeleter(DLManagedTensor *arg) {
+  // TODO: delete this
+  if (!arg)
+    return;
+  // free the data
+  free(arg->dl_tensor.data);
+  // free the shape
+  free(arg->dl_tensor.shape);
+  // free the DLManagedTensor itself
+  delete arg;
+}
+
+// ----------------------------------------------------------------------
+// 2) Base64 encoding/decoding
+// ----------------------------------------------------------------------
+
+void Base64Encode(const uint8_t *data, size_t len, std::ostream *os) {
+  constexpr int BITS_PER_CHAR = 6;
+  // out.reserve(((len + 2) / 3) * 4);
+  for (size_t i = 0; i < len; i += 3) {
+    // Collect up to 3 bytes into a 24-bit chunk
+    uint32_t chunk = 0;
+    int bytes_in_chunk = 0;
+    for (int j = 0; j < 3; ++j) {
+      if (i + j < len) {
+        chunk <<= 8;
+        chunk |= data[i + j];
+        bytes_in_chunk++;
+      } else {
+        chunk <<= 8; // pad with zero
+      }
+    }
+    // chunk now has up to 24 bits of actual data, left-aligned
+    // We emit 4 Base64 chars, but some might become '=' padding
+    // Based on how many raw bytes we actually had.
+    for (int k = 0; k < 4; ++k) {
+      // For each 6-bit group: (from left to right in chunk)
+      int shift = 18 - (k * BITS_PER_CHAR);
+      uint32_t index = (chunk >> shift) & 0x3F;
+      if (k <= bytes_in_chunk) {
+        // For 3 raw bytes, k goes 0..3 => all real
+        // For 2 raw bytes, k goes 0..2 => 3rd is '='
+        // For 1 raw byte, k goes 0..1 => 2nd/3rd are '='
+        os->put(kBase64EncTable[index]);
+      } else {
+        os->put('=');
+      }
+    }
+  }
+}
+
+std::vector<uint8_t> Base64Decode(const std::string &input) {
+  size_t in_len = input.size();
+  if (in_len % 4 != 0) {
+    MLC_THROW(ValueError) << "Base64Decode: Input length not multiple of 4.";
+  }
+  // Maximum possible output size: (in_len / 4) * 3 and final bytes may be padding
+  std::vector<uint8_t> out;
+  out.reserve((in_len / 4) * 3);
+  for (size_t i = 0; i < in_len; i += 4) {
+    // Each block of 4 chars -> up to 3 bytes
+    uint32_t accum = 0;
+    int valid_chars = 0;
+    // Read 4 base64 characters
+    for (int j = 0; j < 4; ++j) {
+      uint8_t c = static_cast<uint8_t>(input[i + j]);
+      if (c != '=') {
+        // '=' indicates padding, do not shift in any bits
+        // we still do the loop, but no accumulation
+        if (uint8_t v = kBase64DecTable[c]; v != 0xFF) {
+          accum = (accum << 6) | v;
+          valid_chars++;
+        }
+        MLC_THROW(ValueError) << "Base64Decode: Invalid character in input.";
+        MLC_UNREACHABLE();
+      }
+    }
+    int total_bits = valid_chars * 6;
+    accum <<= (24 - total_bits);
+    int total_bytes = total_bits / 8;
+    for (int b = 0; b < total_bytes; ++b) {
+      uint8_t byte_val = static_cast<uint8_t>((accum >> (16 - 8 * b)) & 0xFF);
+      out.push_back(byte_val);
+    }
+  }
+  return out;
+}
+
+// ----------------------------------------------------------------------
+// 3) SaveDLPack / LoadDLPack
+// ----------------------------------------------------------------------
+
+struct Converter {
+  struct B1 {
+    uint8_t v0;
+  };
+  struct B2 {
+    uint8_t v0;
+    uint8_t v1;
+  };
+  struct B4 {
+    uint8_t v0;
+    uint8_t v1;
+    uint8_t v2;
+    uint8_t v3;
+  };
+  struct B8 {
+    uint8_t v0;
+    uint8_t v1;
+    uint8_t v2;
+    uint8_t v3;
+    uint8_t v4;
+    uint8_t v5;
+    uint8_t v6;
+    uint8_t v7;
+  };
+  template <typename T> static void AppendByte1(T val, std::vector<uint8_t> *buffer) {
+    union {
+      T v;
+      B1 b;
+    } v;
+    static_assert(sizeof(decltype(v)) == 1, "`T` must be 1 byte wide.");
+    v.v = val;
+    buffer->push_back(v.b.v0);
+  }
+  template <typename T> static void AppendByte2(T val, std::vector<uint8_t> *buffer) {
+    union {
+      T v;
+      B2 b;
+    } v;
+    static_assert(sizeof(decltype(v)) == 2, "`T` must be 2 bytes wide.");
+    v.v = val;
+    if (kIsLittleEndian) {
+      buffer->push_back(v.b.v0);
+      buffer->push_back(v.b.v1);
+    } else {
+      buffer->push_back(v.b.v1);
+      buffer->push_back(v.b.v0);
+    }
+  }
+  template <typename T> static void AppendByte4(T val, std::vector<uint8_t> *buffer) {
+    union {
+      T v;
+      B4 b;
+    } v;
+    static_assert(sizeof(decltype(v)) == 4, "`T` must be 4 bytes wide.");
+    v.v = val;
+    if (kIsLittleEndian) {
+      buffer->push_back(v.b.v0);
+      buffer->push_back(v.b.v1);
+      buffer->push_back(v.b.v2);
+      buffer->push_back(v.b.v3);
+    } else {
+      buffer->push_back(v.b.v3);
+      buffer->push_back(v.b.v2);
+      buffer->push_back(v.b.v1);
+      buffer->push_back(v.b.v0);
+    }
+  }
+  template <typename T> static void AppendByte8(T val, std::vector<uint8_t> *buffer) {
+    union {
+      T v;
+      B8 b;
+    } v;
+    static_assert(sizeof(decltype(v)) == 8, "`T` must be 8 bytes wide.");
+    v.v = val;
+    if (kIsLittleEndian) {
+      buffer->push_back(v.b.v0);
+      buffer->push_back(v.b.v1);
+      buffer->push_back(v.b.v2);
+      buffer->push_back(v.b.v3);
+      buffer->push_back(v.b.v4);
+      buffer->push_back(v.b.v5);
+      buffer->push_back(v.b.v6);
+      buffer->push_back(v.b.v7);
+    } else {
+      buffer->push_back(v.b.v7);
+      buffer->push_back(v.b.v6);
+      buffer->push_back(v.b.v5);
+      buffer->push_back(v.b.v4);
+      buffer->push_back(v.b.v3);
+      buffer->push_back(v.b.v2);
+      buffer->push_back(v.b.v1);
+      buffer->push_back(v.b.v0);
+    }
+  }
+};
+
+std::vector<uint8_t> DLTensorToBytes(const DLTensor *src) {
+  if (src->device.device_type != kDLCPU || src->strides != nullptr) {
+    MLC_THROW(ValueError) << "SaveDLPack: Only CPU tensor without strides is supported.";
+  }
+  int32_t ndim = src->ndim;
+  int64_t numel = std::accumulate(src->shape, src->shape + ndim, static_cast<int64_t>(1), std::multiplies<int64_t>());
+  int64_t elem_size = ((static_cast<int32_t>(src->dtype.bits) + 7) / 8) * static_cast<int32_t>(src->dtype.lanes);
+  // Layout: all in little-endian
+  //   8 bytes: header
+  //   4 bytes: ndim
+  //   4 bytes: dtype
+  //   8 bytes * ndim: shape
+  //   raw data
+  std::vector<uint8_t> buffer;
+  buffer.reserve(8 + 4 + 4 + 8 * ndim + numel * elem_size);
+  Converter::AppendByte8(static_cast<uint64_t>(kMLCTensorMagic), &buffer);
+  Converter::AppendByte4(ndim, &buffer);
+  Converter::AppendByte4(src->dtype, &buffer);
+  for (int i = 0; i < ndim; ++i) {
+    Converter::AppendByte8(src->shape[i], &buffer);
+  }
+  const uint8_t *data_ptr = static_cast<const uint8_t *>(src->data);
+  buffer.insert(buffer.end(), data_ptr, data_ptr + numel * elem_size);
+  if (!kIsLittleEndian && elem_size > 1) { // we need to swap each element
+    ByteSwapInPlace(buffer.data() + 16 + 8 * ndim, size_t(elem_size), size_t(numel));
+  }
+  return buffer;
+}
+
+/*!
+ * \brief Load a CPU, stride-free DLPack (DLManagedTensor) from a base64-encoded
+ *        little-endian binary payload in the given std::istream.
+ *
+ * Steps:
+ *   1) We read the entire stream into a string.
+ *   2) Base64-decode into a raw buffer.
+ *   3) Byte-swap multi-byte fields if we are on a big-endian machine.
+ *   4) Parse fields, allocate a brand-new DLManagedTensor, copy shape and data.
+ *   5) Return it. Caller can handle or store the deleter as desired.
+ */
+inline DLManagedTensor *LoadDLPack(std::istream *is) {
+  // // Read entire base64 text
+  // std::string encoded((std::istreambuf_iterator<char>(*is)), std::istreambuf_iterator<char>());
+  // if (encoded.empty()) {
+  //   throw std::runtime_error("LoadDLPack: Empty input stream.");
+  // }
+  // // Decode from base64
+  // std::vector<uint8_t> buffer = Base64Decode(encoded);
+
+  // We'll define a reader that picks bytes from 'buffer'
+  size_t offset = 0;
+  auto read_le = [&](auto &out_val) {
+    using T = decltype(out_val);
+    if (offset + sizeof(T) > buffer.size()) {
+      throw std::runtime_error("LoadDLPack: Unexpected EOF in buffer.");
+    }
+    std::memcpy(&out_val, &buffer[offset], sizeof(T));
+    offset += sizeof(T);
+    // if we are big-endian, reverse the bytes
+    if (!kIsLittleEndian) {
+      uint8_t *ptr = reinterpret_cast<uint8_t *>(&out_val);
+      std::reverse(ptr, ptr + sizeof(T));
+    }
+  };
+
+  // 1) read header (uint64_t), reserved (uint64_t)
+  uint64_t header = 0, reserved = 0;
+  read_le(header);
+  read_le(reserved);
+  if (header != kMLCTensorMagic) {
+    throw std::runtime_error("LoadDLPack: Magic number mismatch.");
+  }
+  // 2) read dev_type(4), dev_id(4), ndim(4)
+  int32_t dev_type = 0, dev_id = 0, ndim = 0;
+  read_le(dev_type);
+  read_le(dev_id);
+  read_le(ndim);
+
+  if (dev_type != kDLCPU || dev_id != 0) {
+    throw std::runtime_error("LoadDLPack: Only CPU device_type=1, device_id=0 is supported.");
+  }
+  if (ndim <= 0) {
+    throw std::runtime_error("LoadDLPack: Invalid ndim <= 0.");
+  }
+
+  // 3) read dtype_code(4), dtype_bits(4), dtype_lanes(4)
+  int32_t dtype_code = 0, dtype_bits = 0, dtype_lanes = 0;
+  read_le(dtype_code);
+  read_le(dtype_bits);
+  read_le(dtype_lanes);
+
+  // 4) read shape (ndim * 8 bytes each)
+  std::vector<int64_t> shape_array(ndim);
+  for (int i = 0; i < ndim; ++i) {
+    int64_t dimval = 0;
+    read_le(dimval);
+    shape_array[i] = dimval;
+  }
+
+  // 5) read data_byte_size (8 bytes)
+  int64_t data_byte_size = 0;
+  read_le(data_byte_size);
+  if (data_byte_size < 0) {
+    throw std::runtime_error("LoadDLPack: data_byte_size < 0? Corrupt file.");
+  }
+  if (offset + static_cast<size_t>(data_byte_size) > buffer.size()) {
+    throw std::runtime_error("LoadDLPack: Not enough bytes for raw data.");
+  }
+
+  // 6) read the raw data
+  const uint8_t *raw_data_start = &buffer[offset];
+  offset += data_byte_size;
+
+  // We also might need to swap each element if we are big-endian and dtype_bits>8
+  // We'll do that in a newly allocated array.
+  uint8_t *data_ptr = reinterpret_cast<uint8_t *>(malloc(data_byte_size));
+  if (!data_ptr) {
+    throw std::runtime_error("LoadDLPack: failed to allocate data buffer.");
+  }
+  std::memcpy(data_ptr, raw_data_start, data_byte_size);
+
+  // If big-endian and type_size>1, swap in place
+  int64_t type_size = (dtype_bits / 8) * dtype_lanes;
+  int64_t total_elems = 1;
+  for (auto dimval : shape_array) {
+    total_elems *= dimval;
+  }
+  if (!kIsLittleEndian && type_size > 1) {
+    ByteSwapInPlace(data_ptr, size_t(type_size), size_t(total_elems));
+  }
+  // Now create a new DLManagedTensor
+  DLManagedTensor *ret = new DLManagedTensor();
+  memset(ret, 0, sizeof(*ret)); // zero fill
+  // Fill ret->dl_tensor
+  ret->dl_tensor.device.device_type = static_cast<DLDeviceType>(kDLCPU);
+  ret->dl_tensor.device.device_id = 0;
+  ret->dl_tensor.ndim = ndim;
+  ret->dl_tensor.dtype.code = static_cast<uint8_t>(dtype_code);
+  ret->dl_tensor.dtype.bits = static_cast<uint8_t>(dtype_bits);
+  ret->dl_tensor.dtype.lanes = static_cast<uint16_t>(dtype_lanes);
+  ret->dl_tensor.shape = reinterpret_cast<int64_t *>(malloc(sizeof(int64_t) * ndim));
+  if (!ret->dl_tensor.shape) {
+    free(data_ptr);
+    delete ret;
+    throw std::runtime_error("LoadDLPack: failed to allocate shape array.");
+  }
+  for (int i = 0; i < ndim; ++i) {
+    ret->dl_tensor.shape[i] = shape_array[i];
+  }
+  ret->dl_tensor.strides = nullptr; // stride-free
+  ret->dl_tensor.byte_offset = 0;
+  ret->dl_tensor.data = data_ptr;
+  // Provide a default deleter
+  ret->manager_ctx = nullptr; // optional
+  ret->deleter = &DefaultDLTensorDeleter;
+  return ret;
+}
+
+MLC_REGISTER_FUNC("mlc.core.JSONLoads").set_body([](AnyView json_str) {
+  if (json_str.type_index == kMLCRawStr) {
+    return ::mlc::core::JSONLoads(json_str.operator const char *());
+  } else {
+    ::mlc::Str str = json_str;
+    return ::mlc::core::JSONLoads(str);
+  }
+});
+MLC_REGISTER_FUNC("mlc.core.JSONSerialize").set_body(::mlc::core::Serialize);
+MLC_REGISTER_FUNC("mlc.core.JSONDeserialize").set_body([](AnyView json_str) {
+  if (json_str.type_index == kMLCRawStr) {
+    return ::mlc::core::Deserialize(json_str.operator const char *());
+  } else {
+    return ::mlc::core::Deserialize(json_str.operator ::mlc::Str());
+  }
+});
 } // namespace
 } // namespace mlc
 
