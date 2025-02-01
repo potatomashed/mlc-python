@@ -206,7 +206,11 @@ template <typename R, typename... Args> inline R VTable::operator()(Args... args
   Any ret;
   stack_args.Fill(std::forward<Args>(args)...);
   MLC_CHECK_ERR(::MLCVTableCall(self, N, stack_args.v, &ret));
-  return ret;
+  if constexpr (std::is_same_v<R, void>) {
+    return;
+  } else {
+    return ret;
+  }
 }
 template <typename Obj> inline VTable &VTable::Set(Func func) {
   constexpr bool override_mode = false;
