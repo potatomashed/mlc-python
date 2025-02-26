@@ -53,6 +53,7 @@ if (MLC_BUILD_REGISTRY)
     "${CMAKE_CURRENT_SOURCE_DIR}/cpp/traceback.cc"
     "${CMAKE_CURRENT_SOURCE_DIR}/cpp/traceback_win.cc"
     "${CMAKE_CURRENT_SOURCE_DIR}/cpp/sym/sym.cc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/cpp/sym/const_int_bound.cc"
   )
   set_target_properties(
     mlc_registry_objs PROPERTIES
